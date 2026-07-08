@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+browser-profile/
+playwright-profile/
+
+debug_*.html
+debug_*.png
+*.log
+
+.DS_Store

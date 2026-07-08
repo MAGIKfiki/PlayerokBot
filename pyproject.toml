@@ -1,0 +1,11 @@
+[project]
+name = "playerok-bot"
+version = "0.1.0"
+description = "Автоматизація обробки замовлень Playerok (MVP)"
+requires-python = ">=3.12"
+dependencies = [
+    "playwright>=1.45",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
