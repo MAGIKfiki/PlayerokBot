@@ -5,8 +5,26 @@ __pycache__/
 browser-profile/
 playwright-profile/
 
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
 debug_*.html
 debug_*.png
 *.log
 
 .DS_Store
+
+run_bot.sh
+
+# Конфлікт-копії (macOS sync/backup) — старі дублікати поруч з актуальними
+# файлами, ніким не імпортуються. Не видаляємо наявні, лише не трекаємо нові.
+* 2.py
+* 2.json
+* 2.toml
+* 2
+
+# На випадок, якщо колись з'явиться .env (зараз проєкт його не використовує)
+.env
+.env.*

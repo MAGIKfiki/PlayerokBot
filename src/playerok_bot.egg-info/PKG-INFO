@@ -4,3 +4,6 @@ Version: 0.1.0
 Summary: Автоматизація обробки замовлень Playerok (MVP)
 Requires-Python: >=3.12
 Requires-Dist: playwright>=1.45
+Requires-Dist: httpx>=0.27
+Requires-Dist: Pillow>=10.0
+Requires-Dist: imagehash>=4.3

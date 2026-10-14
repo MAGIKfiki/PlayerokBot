@@ -23,60 +23,28 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from playwright.async_api import Page, expect
+from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from playerok_bot.playerok import selectors
+from playerok_bot.playerok.profile import PLAYEROK_BASE_URL, get_own_profile_username
 
-PLAYEROK_BASE_URL = "https://playerok.com"
-
-_OWN_PROFILE_HREF_PATTERN = re.compile(r"^/profile/([^/]+)")
-# Одразу після domcontentloaded шапка сайту ще може показувати дефолтний
-# href "/profile/auth" (до того, як клієнтський JS підвантажить реальний
-# стан логіну) — тому чекаємо саме на реальний username, а не /profile/auth.
-_LOGGED_IN_PROFILE_HREF_PATTERN = re.compile(r"^/profile/(?!auth(?:/|$))[^/]+")
-_USERNAME_WAIT_TIMEOUT_MS = 10000
 _CONTENT_WAIT_TIMEOUT_MS = 10000
+
+# Playerok deal id — глобально унікальний UUID у /deal/<uuid>, головний
+# природний ключ угоди для персистентності (db/orders.py).
+_DEAL_ID_PATTERN = re.compile(re.escape(PLAYEROK_BASE_URL) + r"/deal/([^/?#]+)")
 
 
 @dataclass(frozen=True)
 class Order:
+    deal_id: str
     product_name: str
+    product_url: str
     amount: str
     buyer_name: str
     conversation_url: str
     status: str
-
-
-async def _get_own_profile_username(page: Page) -> str:
-    """Дістає власний username із href посилання "Профіль" у шапці сайту.
-
-    Це читання атрибута (без кліку) — потрібне лише для побудови прямого URL
-    сторінки продажів, не для навігації кліками.
-
-    Одразу після domcontentloaded href цього посилання інколи ще дефолтний
-    "/profile/auth" (гідратація клієнта, що підвантажує реальний стан логіну,
-    ще не завершилась) — тому чекаємо (через expect(...).to_have_attribute,
-    вбудований поллінг Playwright, без asyncio.sleep), поки href не стане
-    реальним username.
-    """
-    await page.goto(PLAYEROK_BASE_URL, wait_until="domcontentloaded")
-
-    profile_link = page.locator(selectors.PROFILE_LINK).first
-    try:
-        await expect(profile_link).to_have_attribute(
-            "href", _LOGGED_IN_PROFILE_HREF_PATTERN, timeout=_USERNAME_WAIT_TIMEOUT_MS
-        )
-    except AssertionError:
-        pass  # читаємо що є нижче — невалідний формат відловить перевірка нижче
-
-    href = await profile_link.get_attribute("href")
-    if href is None:
-        raise RuntimeError("Не знайдено посилання на профіль у шапці сайту")
-    match = _OWN_PROFILE_HREF_PATTERN.match(href)
-    if match is None:
-        raise RuntimeError(f"Неочікуваний формат посилання на профіль: {href!r}")
-    return match.group(1)
 
 
 async def open_new_orders(page: Page) -> None:
@@ -84,7 +52,7 @@ async def open_new_orders(page: Page) -> None:
 
     Прямий перехід на /profile/<username>/sales — без кліків по меню.
     """
-    username = await _get_own_profile_username(page)
+    username = await get_own_profile_username(page)
     await page.goto(
         f"{PLAYEROK_BASE_URL}/profile/{username}/sales", wait_until="domcontentloaded"
     )
@@ -133,8 +101,18 @@ async def read_order(page: Page) -> Order:
     if chat_href is None:
         raise RuntimeError("Не знайдено посилання на чат з покупцем на сторінці угоди")
 
+    product_href = await product_link.get_attribute("href")
+    if product_href is None:
+        raise RuntimeError("Не знайдено посилання на товар на сторінці угоди")
+
+    deal_id_match = _DEAL_ID_PATTERN.match(page.url)
+    if deal_id_match is None:
+        raise RuntimeError(f"Неочікуваний URL сторінки угоди: {page.url!r}")
+
     return Order(
+        deal_id=deal_id_match.group(1),
         product_name=(await product_link.inner_text()).strip(),
+        product_url=f"{PLAYEROK_BASE_URL}{product_href}",
         amount=(await amount_el.inner_text()).strip(),
         buyer_name=(await buyer_link.inner_text()).strip(),
         conversation_url=f"{PLAYEROK_BASE_URL}{chat_href}",

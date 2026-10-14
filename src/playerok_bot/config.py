@@ -22,3 +22,27 @@ def load_browser_config() -> BrowserConfig:
         default_timeout_ms=int(os.getenv("BROWSER_DEFAULT_TIMEOUT_MS", "30000")),
         user_data_dir=Path(os.getenv("BROWSER_USER_DATA_DIR", "./browser-profile")),
     )
+
+
+@dataclass(frozen=True)
+class TelegramConfig:
+    bot_token: str
+    chat_id: str
+
+
+def load_telegram_config() -> TelegramConfig:
+    return TelegramConfig(
+        bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+    )
+
+
+@dataclass(frozen=True)
+class DatabaseConfig:
+    path: Path
+
+
+def load_database_config() -> DatabaseConfig:
+    return DatabaseConfig(
+        path=Path(os.getenv("DATABASE_PATH", "./data/playerok_bot.sqlite3")),
+    )
