@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 import traceback
 from pathlib import Path
 
@@ -62,16 +63,77 @@ _POLL_INTERVAL_MAX_SECONDS = 5.0
 
 _NETWORK_ERROR_MARKERS = ("net::", "econnreset", "etimedout", "enotfound", "network")
 
+# Фрази, якими Playwright повідомляє про ОСТАТОЧНУ втрату браузерної сесії
+# (сам браузер/контекст/сторінка фізично закриті) — на відміну від тимчасових
+# мережевих збоїв чи таймаутів одного запиту. Реальний випадок 2026-08-01:
+# "Page.goto: Target page, context or browser has been closed" — повторювався
+# на кожному циклі нескінченно, бо _supervised() перезапускав саму функцію
+# циклу, але не саму Page/BrowserContext, яка лишалась мертвою назавжди.
+_BROWSER_LOST_MARKERS = (
+    "has been closed",
+    "target closed",
+    "browser has disconnected",
+    "connection closed",
+)
+
 _BACKLOG_SCAN_MIN_INTERVAL_SECONDS = 60
 # Пауза перед перезапуском циклу після аварійного завершення (_supervised) —
 # щоб раптовий постійний збій (напр. вичерпане місце на диску) не спамив
 # перезапусками сотні разів на секунду.
 _LOOP_RESTART_DELAY_SECONDS = 5.0
 
+# Обмежений exponential backoff для ВІДНОВЛЕННЯ цілої браузерної сесії
+# (новий BrowserSession + нові Page + повторний логін) — окремо від
+# _LOOP_RESTART_DELAY_SECONDS вище, який лише про перезапуск однієї функції
+# циклу. Якщо сесія пропрацювала досить довго (_RECOVERY_RESET_THRESHOLD_
+# SECONDS) перш ніж знову впасти — це вважається "новим" збоєм, і backoff
+# скидається на початкове значення, а не продовжує рости нескінченно.
+_RECOVERY_INITIAL_BACKOFF_SECONDS = 5.0
+_RECOVERY_MAX_BACKOFF_SECONDS = 300.0
+_RECOVERY_RESET_THRESHOLD_SECONDS = 120.0
+
+
+class BrowserSessionLost(Exception):
+    """Браузер/контекст/сторінка остаточно закриті — продовжувати цей цикл
+    із тими самими об'єктами Page безглуздо. Навмисно НЕ перехоплюється
+    всередині _run_polling_loop/_run_backlog_scan_loop/_supervised() —
+    пропускається до main(), де вся браузерна сесія перестворюється
+    цілком (нові Page, повторний логін), а не лише перезапускається
+    функція циклу зі старою, вже мертвою Page."""
+
 
 def _looks_like_network_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     return any(marker in text for marker in _NETWORK_ERROR_MARKERS)
+
+
+def _recovery_sleep_seconds(stored_backoff: float, session_duration_seconds: float) -> float:
+    """Скільки секунд чекати перед ЦІЄЮ спробою відновлення браузерної сесії.
+
+    Чиста функція (без I/O) — винесена окремо саме для того, щоб логіку
+    "обмеженого exponential backoff, що скидається після досить довгої
+    стабільної роботи" можна було перевірити тестами без запуску реального
+    asyncio.gather()/Playwright. `stored_backoff` — значення, накопичене з
+    попередніх спроб; якщо щойно завершена сесія протрималась довше за
+    _RECOVERY_RESET_THRESHOLD_SECONDS, це вважається новим збоєм і
+    повертається початкове значення замість накопиченого. Подвоєння
+    (з обмеженням _RECOVERY_MAX_BACKOFF_SECONDS) застосовується викликачем
+    ПІСЛЯ сну, на основі значення, яке фактично було використано зараз.
+    """
+    if session_duration_seconds >= _RECOVERY_RESET_THRESHOLD_SECONDS:
+        return _RECOVERY_INITIAL_BACKOFF_SECONDS
+    return stored_backoff
+
+
+def _is_browser_session_lost(exc: BaseException) -> bool:
+    """Відрізняє ОСТАТОЧНУ втрату браузера від тимчасового мережевого збою
+    чи таймауту одного запиту (_looks_like_network_error) — обидва
+    трапляються у тому самому except (PlaywrightError, PlaywrightTimeoutError)
+    блоці, але вимагають принципово різної реакції: тимчасовий збій можна
+    просто повторити на наступному циклі тією самою Page; втрату браузера —
+    ні, потрібна зовсім нова сесія (main._run_one_browser_session)."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _BROWSER_LOST_MARKERS)
 
 
 def _mark_heartbeat_safely(db_path: Path, event_type: str) -> None:
@@ -132,6 +194,11 @@ async def _run_polling_loop(
             except Exception:
                 logger.exception("Не вдалося записати mark_successful_cycle — продовжуємо")
         except (PlaywrightError, PlaywrightTimeoutError) as exc:
+            if _is_browser_session_lost(exc):
+                logger.critical("Браузерну сесію втрачено під час order-polling: %s", exc)
+                db_logs.log_event(db_path, "critical_error", f"[order-polling] Браузерну сесію втрачено: {exc}"[:500])
+                bot_state.mark_error(db_path, str(exc)[:500])
+                raise BrowserSessionLost(str(exc)) from exc
             logger.exception("Playwright/мережева помилка під час циклу — продовжуємо")
             event_type = "network_loss" if _looks_like_network_error(exc) else "playwright_error"
             db_logs.log_event(db_path, event_type, str(exc)[:500])
@@ -176,6 +243,11 @@ async def _run_backlog_scan_loop(
                 page, notifier, db_path, relist_locks, deal_locks, dry_run=dry_run
             )
         except (PlaywrightError, PlaywrightTimeoutError) as exc:
+            if _is_browser_session_lost(exc):
+                logger.critical("Браузерну сесію втрачено під час backlog-скану: %s", exc)
+                db_logs.log_event(db_path, "critical_error", f"[backlog-scan] Браузерну сесію втрачено: {exc}"[:500])
+                bot_state.mark_error(db_path, str(exc)[:500])
+                raise BrowserSessionLost(str(exc)) from exc
             logger.exception("Playwright/мережева помилка під час backlog-скану — продовжуємо")
             event_type = "network_loss" if _looks_like_network_error(exc) else "playwright_error"
             db_logs.log_event(db_path, event_type, str(exc)[:500])
@@ -204,6 +276,12 @@ async def _supervised(name: str, loop_factory, db_path: Path) -> None:
     зовнішній запобіжник на випадок, якщо теорія колись не спрацює.
     asyncio.CancelledError навмисно НЕ перехоплюється — справжнє скасування
     (напр. Ctrl+C) має завершити цикл, а не "самозцілитись".
+
+    BrowserSessionLost так само НЕ перехоплюється й НЕ лікується тут: немає
+    сенсу перезапускати функцію циклу зі старою Page, яка вже остаточно
+    закрита. Замість цього виняток проходить крізь asyncio.gather() у
+    main._run_one_browser_session() — gather() сам скасовує сусідній
+    (другий) цикл, і вся браузерна сесія перестворюється цілком.
     """
     while True:
         try:
@@ -211,7 +289,7 @@ async def _supervised(name: str, loop_factory, db_path: Path) -> None:
             logger.critical(
                 "Цикл %s завершився без винятку (неочікувано для `while True`) — перезапускаю", name
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, BrowserSessionLost):
             raise
         except Exception as exc:
             logger.critical("Цикл %s аварійно завершився — перезапускаю: %s", name, exc, exc_info=True)
@@ -225,6 +303,83 @@ async def _supervised(name: str, loop_factory, db_path: Path) -> None:
             except Exception:
                 pass
         await asyncio.sleep(_LOOP_RESTART_DELAY_SECONDS)
+
+
+async def _run_one_browser_session(
+    config,
+    notifier: TelegramNotifier,
+    db_path: Path,
+    started_flag: list[bool],
+) -> None:
+    """Один повний життєвий цикл браузерної сесії: новий BrowserSession,
+    нові Page, повторна перевірка логіну, обидва робочі цикли.
+
+    Модульна функція (не вкладений closure) — щоб можна було тестувати
+    напряму, підмінюючи BrowserSession/ensure_logged_in моками, без запуску
+    всього main() і реального Playwright.
+
+    started_flag — одноелементний список-"комірка" замість nonlocal: перший
+    успішний логін виставляє started_flag[0] = True, щоб main() знав, що
+    is_running слід скинути у фінальному finally (той самий запобіжник, що
+    й раніше, — другий невдалий інстанс не повинен стирати is_running=1
+    першого, уже живого).
+
+    Завершується виключно винятком — або BrowserSessionLost (сесію навмисно
+    не рятуємо тут, main() перехопить і перестворить усе заново), або іншою
+    помилкою (напр. не вдалося запустити Chromium, не вдалося увійти).
+    asyncio.gather() всередині гарантує, що коли ОДИН із двох циклів впаде
+    з BrowserSessionLost, інший буде скасований gather'ом автоматично — не
+    продовжить працювати зі своєю окремою Page від уже мертвого контексту.
+    """
+    async with BrowserSession(config) as session:
+        page = await session.new_page()
+
+        try:
+            await ensure_logged_in(page)
+        except Exception as exc:
+            db_logs.log_event(
+                db_path,
+                "auth_failure",
+                f"Не вдалося увійти в Playerok: {exc}",
+                details={"traceback": traceback.format_exc()},
+            )
+            raise
+        bot_state.mark_login(db_path)
+        bot_state.mark_running(db_path, True)
+        started_flag[0] = True
+
+        # Окрема вкладка для backlog-скану — той самий persistent-контекст
+        # (уже залогінений), тому повторний логін не потрібен. Окрема
+        # Page — щоб повільний скан "Продажи" не заважав навігації
+        # швидкого order-polling циклу на основній сторінці.
+        backlog_page = await session.new_page()
+        # Нові, порожні локи щоразу для нової сесії — локи з попередньої
+        # (вже мертвої) сесії нікому більше не потрібні: будь-яка угода,
+        # що оброблялась у момент втрати браузера, однаково лишає свій
+        # слід у SQLite (mark_relist_started/record_relist_outcome),
+        # тому повторна обробка після відновлення безпечна незалежно
+        # від того, чи "пам'ятає" про неї конкретний об'єкт asyncio.Lock.
+        relist_locks: dict[str, asyncio.Lock] = {}
+        # Спільний за order.deal_id, окремо від relist_locks (за
+        # product_url) — серіалізує весь pipeline.process_order(), а не
+        # лише клік у relist_product(). Без цього щойно збережене
+        # backlog-скaном замовлення могло одночасно підхопитись і
+        # order-polling циклом (2026-07-23, перший production-тест).
+        deal_locks: dict[str, asyncio.Lock] = {}
+
+        print("Логін виконано. Починаю моніторинг нових замовлень (Ctrl+C для зупинки)...")
+        await asyncio.gather(
+            _supervised(
+                "order-polling",
+                lambda: _run_polling_loop(page, notifier, db_path, relist_locks, deal_locks),
+                db_path,
+            ),
+            _supervised(
+                "backlog-scan",
+                lambda: _run_backlog_scan_loop(backlog_page, notifier, db_path, relist_locks, deal_locks),
+                db_path,
+            ),
+        )
 
 
 async def main() -> None:
@@ -242,53 +397,49 @@ async def main() -> None:
     # конфлікт browser-profile, коли перший інстанс уже живий і працює)
     # своїм finally стирає правдивий is_running=1 першого, справді живого
     # процесу — перевірено наживо: саме так і сталося під час тестування.
-    started = False
-    try:
-        async with BrowserSession(config) as session:
-            page = await session.new_page()
+    # Прапорець живе на рівні ВСІЄЇ роботи процесу (across рестартів
+    # браузерної сесії всередині одного й того самого процесу python), а не
+    # лише однієї сесії — тому оголошений тут, а не всередині
+    # _run_one_browser_session().
+    started_flag = [False]
 
+    try:
+        backoff = _RECOVERY_INITIAL_BACKOFF_SECONDS
+        while True:
+            session_started_at = time.monotonic()
             try:
-                await ensure_logged_in(page)
+                await _run_one_browser_session(config, notifier, db_path, started_flag)
+                logger.critical(
+                    "_run_one_browser_session() завершився без винятку (неочікувано) — перезапускаю"
+                )
+            except asyncio.CancelledError:
+                raise
+            except BrowserSessionLost as exc:
+                logger.critical("Відновлюю браузерну сесію після втрати: %s", exc)
+                db_logs.log_event(
+                    db_path, "critical_error", f"Відновлення браузерної сесії після втрати: {exc}"[:500]
+                )
             except Exception as exc:
+                # Сюди потрапляє, зокрема, провал самого запуску Chromium чи
+                # помилка під час ensure_logged_in (auth_failure вже
+                # залогований окремо вище, тут лише критичний запис і retry).
+                logger.critical(
+                    "Критична помилка браузерної сесії — повторна спроба: %s", exc, exc_info=True
+                )
                 db_logs.log_event(
                     db_path,
-                    "auth_failure",
-                    f"Не вдалося увійти в Playerok: {exc}",
+                    "critical_error",
+                    f"Критична помилка браузерної сесії: {exc}"[:500],
                     details={"traceback": traceback.format_exc()},
                 )
-                raise
-            bot_state.mark_login(db_path)
-            bot_state.mark_running(db_path, True)
-            started = True
 
-            # Окрема вкладка для backlog-скану — той самий persistent-контекст
-            # (уже залогінений), тому повторний логін не потрібен. Окрема
-            # Page — щоб повільний скан "Продажи" не заважав навігації
-            # швидкого order-polling циклу на основній сторінці.
-            backlog_page = await session.new_page()
-            relist_locks: dict[str, asyncio.Lock] = {}
-            # Спільний за order.deal_id, окремо від relist_locks (за
-            # product_url) — серіалізує весь pipeline.process_order(), а не
-            # лише клік у relist_product(). Без цього щойно збережене
-            # backlog-скaном замовлення могло одночасно підхопитись і
-            # order-polling циклом (2026-07-23, перший production-тест).
-            deal_locks: dict[str, asyncio.Lock] = {}
-
-            print("Логін виконано. Починаю моніторинг нових замовлень (Ctrl+C для зупинки)...")
-            await asyncio.gather(
-                _supervised(
-                    "order-polling",
-                    lambda: _run_polling_loop(page, notifier, db_path, relist_locks, deal_locks),
-                    db_path,
-                ),
-                _supervised(
-                    "backlog-scan",
-                    lambda: _run_backlog_scan_loop(backlog_page, notifier, db_path, relist_locks, deal_locks),
-                    db_path,
-                ),
-            )
+            session_duration = time.monotonic() - session_started_at
+            sleep_for = _recovery_sleep_seconds(backoff, session_duration)
+            logger.info("Повторний запуск браузерної сесії через %.0fс", sleep_for)
+            await asyncio.sleep(sleep_for)
+            backoff = min(sleep_for * 2, _RECOVERY_MAX_BACKOFF_SECONDS)
     finally:
-        if started:
+        if started_flag[0]:
             bot_state.mark_running(db_path, False)
         db_logs.log_event(db_path, "shutdown", "Бот завершує роботу")
 

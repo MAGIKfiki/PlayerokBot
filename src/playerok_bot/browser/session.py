@@ -14,12 +14,15 @@ user_data_dir на диску, тому залогінена сесія (нап�
 
 from __future__ import annotations
 
+import logging
 from types import TracebackType
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 from playwright.async_api import Playwright as AsyncPlaywright
 
 from playerok_bot.config import BrowserConfig
+
+logger = logging.getLogger(__name__)
 
 
 class BrowserSession:
@@ -47,10 +50,21 @@ class BrowserSession:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
+        """Звільняє ресурси навіть якщо браузер/контекст уже фактично мертвий
+        (напр. вихід із блоку стався САМЕ через BrowserSessionLost — закриття
+        вже закритого контексту саме по собі кидає виняток). Помилки тут
+        лише логуються, ніколи не маскують і не замінюють оригінальний
+        виняток, через який відбувається вихід із 'async with'."""
         if self._context is not None:
-            await self._context.close()
+            try:
+                await self._context.close()
+            except Exception:
+                logger.warning("Не вдалося коректно закрити BrowserContext (можливо, вже мертвий)", exc_info=True)
         if self._playwright is not None:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception:
+                logger.warning("Не вдалося коректно зупинити Playwright (можливо, вже мертвий)", exc_info=True)
 
     async def new_page(self) -> Page:
         if self._context is None:
